@@ -253,6 +253,22 @@ runs:
       run: |
         set -euo pipefail
 
+        # Isolate OpenCode and agent runtime state to avoid database schema
+        # collisions with other OpenCode versions on persistent self-hosted runners.
+        agent_home="${RUNNER_TEMP}/agent-home"
+        rm -rf "$agent_home/.local/share/opencode"
+        mkdir -p "$agent_home/.cache"
+        if [ -f "$HOME/.gitconfig" ]; then
+          cp "$HOME/.gitconfig" "$agent_home/.gitconfig"
+        fi
+        if [ -d "$HOME/.cache/cs-agent" ] && [ ! -e "$agent_home/.cache/cs-agent" ]; then
+          ln -s "$HOME/.cache/cs-agent" "$agent_home/.cache/cs-agent" 2>/dev/null || cp -r "$HOME/.cache/cs-agent" "$agent_home/.cache/cs-agent"
+        fi
+        export HOME="$agent_home"
+        export XDG_DATA_HOME="${agent_home}/.local/share"
+        export XDG_CONFIG_HOME="${agent_home}/.config"
+        export XDG_STATE_HOME="${agent_home}/.local/state"
+
         config_backup=""
         created_config=false
         exclude_backup=""
