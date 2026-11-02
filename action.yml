@@ -172,6 +172,23 @@ runs:
       run: |
         set -euo pipefail
 
+        # Normalize opencode_auth JSON for OpenCode 1.17.4 compatibility
+        AUTH_JSON="${OPENCODE_AUTH_JSON:-}"
+        if [ -n "$AUTH_JSON" ]; then
+          AUTH_JSON=$(jq '
+            if type == "object" then
+              with_entries(
+                if .value | type == "object" then
+                  if .value.type == null and .value.key != null then
+                    .value = ({type: "api"} + .value)
+                  else . end
+                elif .value | type == "string" then
+                  .value = {type: "api", key: .value}
+                else . end
+              )
+            else . end' <<< "$AUTH_JSON" 2>/dev/null || printf '%s' "$AUTH_JSON")
+        fi
+
         # Build CS_AGENT_CONFIG JSON using jq
         CONFIG=$(jq -n \
           --arg token "$CS_ACCESS_TOKEN" \
@@ -186,7 +203,7 @@ runs:
           --arg anthropic_key "$(printf '%s' "${ANTHROPIC_API_KEY:-}" | tr -d '\n')" \
           --arg openai_key "$(printf '%s' "${OPENAI_API_KEY:-}" | tr -d '\n')" \
           --arg google_key "$(printf '%s' "${GOOGLE_API_KEY:-}" | tr -d '\n')" \
-          --arg opencode_auth "$(printf '%s' "${OPENCODE_AUTH_JSON:-}" | tr -d '\n')" \
+          --arg opencode_auth "$(printf '%s' "${AUTH_JSON:-}" | tr -d '\n')" \
           '{
             codescene_access_token: $token,
             print_logs: $print_logs,
@@ -231,6 +248,8 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number }}
         MODEL: ${{ inputs.model }}
         CS_AGENT_CONFIG: ${{ steps.agent_config.outputs.json }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+        CLOUDFLARE_API_KEY: ${{ env.CLOUDFLARE_API_KEY }}
       run: |
         set -euo pipefail
 
@@ -240,9 +259,11 @@ runs:
         restore_config() {
           if [ "$created_config" = true ]; then
             rm -f opencode.json
-            cp "$exclude_backup" "$exclude_path"
+            if [ -n "$exclude_backup" ] && [ -f "$exclude_backup" ]; then
+              cp "$exclude_backup" "$exclude_path"
+            fi
           fi
-          if [ -n "$config_backup" ]; then
+          if [ -n "$config_backup" ] && [ -f "$config_backup" ]; then
             cp "$config_backup" opencode.json
             git update-index --no-skip-worktree -- opencode.json
           fi
@@ -271,18 +292,21 @@ runs:
             created_config=true
             printf '{}\n' > opencode.json
           fi
-          model_id="${MODEL#cloudflare-workers-ai/}"
-          credential_file="${RUNNER_TEMP}/cloudflare-provider-key"
-          (umask 077; jq -r '.provider.opencode_auth_json | fromjson | .["cloudflare-workers-ai"].key // error("Workers AI credential missing")' <<< "$CS_AGENT_CONFIG" | tr -d '\n' > "$credential_file")
-          jq --arg model "$model_id" --arg account "$CLOUDFLARE_ACCOUNT_ID" --arg key "{file:$credential_file}" '
-            .provider["cloudflare-ci"] = {
-              npm: "@ai-sdk/openai-compatible",
-              name: "Cloudflare Workers AI",
-              options: {baseURL: ("https://api.cloudflare.com/client/v4/accounts/" + $account + "/ai/v1"), apiKey: $key},
-              models: {($model): {name: $model, limit: {context: 1048576, output: 16384}}}
-            }' opencode.json > "${RUNNER_TEMP}/opencode-provider.json"
-          cp "${RUNNER_TEMP}/opencode-provider.json" opencode.json
-          MODEL="cloudflare-ci/$model_id"
+
+          cf_key="${CLOUDFLARE_API_KEY:-}"
+          if [ -z "$cf_key" ]; then
+            cf_key=$(jq -r '.provider.opencode_auth_json | fromjson | (if .["cloudflare-workers-ai"] | type == "object" then .["cloudflare-workers-ai"].key else .["cloudflare-workers-ai"] end) // empty' <<< "$CS_AGENT_CONFIG" 2>/dev/null || true)
+          fi
+
+          account_id="${CLOUDFLARE_ACCOUNT_ID:-}"
+          if [ -n "$account_id" ]; then
+            jq --arg account "$account_id" --arg key "$cf_key" '
+              .provider["cloudflare-workers-ai"].options.accountId = $account |
+              .provider["cloudflare-workers-ai"].options.baseURL = ("https://api.cloudflare.com/client/v4/accounts/" + $account + "/ai/v1") |
+              (if $key != "" then .provider["cloudflare-workers-ai"].options.apiKey = $key else . end)
+            ' opencode.json > "${RUNNER_TEMP}/opencode-provider.json"
+            cp "${RUNNER_TEMP}/opencode-provider.json" opencode.json
+          fi
         fi
 
         # Commands without an explicit skill use the PR regression-repair workflow.
