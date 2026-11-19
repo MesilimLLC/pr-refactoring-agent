@@ -38,7 +38,7 @@ inputs:
     description: 'Google API key (required for google/* models)'
     required: false
   opencode_auth_json:
-    description: 'OpenCode auth JSON (required for github-copilot/* models)'
+    description: 'OpenCode auth JSON (required for github-copilot/* models; may carry a model_api key for Meta Model API models when MODEL_API_KEY env is unset)'
     required: false
   ca_bundle:
     description: 'Path to a custom CA certificate bundle (PEM format) for SSL/TLS verification. Required for on-prem CodeScene instances with custom certificates.'
@@ -250,6 +250,7 @@ runs:
         CS_AGENT_CONFIG: ${{ steps.agent_config.outputs.json }}
         CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
         CLOUDFLARE_API_KEY: ${{ env.CLOUDFLARE_API_KEY }}
+        MODEL_API_KEY: ${{ env.MODEL_API_KEY }}
       run: |
         set -euo pipefail
 
@@ -293,7 +294,7 @@ runs:
         fi
         BINARY="${RUNNER_TEMP}/refactoring-agent/refactoring-agent"
 
-        if [[ "$MODEL" == cloudflare-workers-ai/* ]]; then
+        if [[ "$MODEL" == cloudflare-workers-ai/* || "$MODEL" == model_api/* ]]; then
           if [ -z "$config_backup" ] && [ -f opencode.json ]; then
             config_backup="${RUNNER_TEMP}/opencode-original.json"
             cp opencode.json "$config_backup"
@@ -320,6 +321,29 @@ runs:
               .provider["cloudflare-workers-ai"].options.accountId = $account |
               .provider["cloudflare-workers-ai"].options.baseURL = ("https://api.cloudflare.com/client/v4/accounts/" + $account + "/ai/v1") |
               (if $key != "" then .provider["cloudflare-workers-ai"].options.apiKey = $key else . end)
+            ' opencode.json > "${RUNNER_TEMP}/opencode-provider.json"
+            cp "${RUNNER_TEMP}/opencode-provider.json" opencode.json
+          fi
+
+          if [[ "$MODEL" == model_api/* ]]; then
+            meta_key="${MODEL_API_KEY:-}"
+            if [ -z "$meta_key" ]; then
+              meta_key=$(jq -r '.provider.opencode_auth_json | fromjson | (if .["model_api"] | type == "object" then .["model_api"].key else .["model_api"] end) // empty' <<< "$CS_AGENT_CONFIG" 2>/dev/null || true)
+            fi
+            meta_model="${MODEL#model_api/}"
+            jq --arg key "$meta_key" --arg model "$meta_model" '
+              .provider["model_api"] = {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Meta Model API",
+                options: { baseURL: "https://api.meta.ai/v1" }
+              }
+              | (if $key != "" then .provider["model_api"].options.apiKey = $key else . end)
+              | .provider["model_api"].models[$model] = (
+                  if $model | startswith("muse-ember") then
+                    {name: "Muse Ember", limit: {context: 1048576, output: 524288}}
+                  elif $model | startswith("muse-spark") then
+                    {name: "Muse Spark", limit: {context: 1048576, output: 131072}}
+                  else {name: $model, limit: {context: 1048576, output: 131072}} end)
             ' opencode.json > "${RUNNER_TEMP}/opencode-provider.json"
             cp "${RUNNER_TEMP}/opencode-provider.json" opencode.json
           fi
